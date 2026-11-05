@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -26,6 +27,35 @@ func addOpenRouterHeaders(req *http.Request, cfg *config.Config) {
 	if cfg.OpenRouterAppName != "" {
 		req.Header.Set("X-Title", cfg.OpenRouterAppName)
 	}
+}
+
+// writeUpstreamFailure answers an upstream failure with the upstream's own
+// status code and body, wrapped in Anthropic's error envelope.
+//
+// Status pass-through is the whole point: Claude Code retries 5xx and 429 with
+// exponential backoff but gives up immediately on 401/403. Answering 500 for a
+// quota rejection turned a one-second failure into ~3 minutes per call.
+func writeUpstreamFailure(c *fiber.Ctx, err error) error {
+	var upstream *UpstreamError
+	if errors.As(err, &upstream) {
+		return c.Status(downstreamStatus(upstream.Status)).JSON(fiber.Map{
+			"type": "error",
+			"error": fiber.Map{
+				"type":    "api_error",
+				"message": upstream.Error(),
+			},
+		})
+	}
+	// Not an upstream HTTP failure (marshal error, connection refused, ...):
+	// that is a genuine proxy-side fault, so 502 keeps the retry semantics
+	// without claiming the upstream rejected the request.
+	return c.Status(http.StatusBadGateway).JSON(fiber.Map{
+		"type": "error",
+		"error": fiber.Map{
+			"type":    "api_error",
+			"message": fmt.Sprintf("OpenAI API error: %v", err),
+		},
+	})
 }
 
 // handleMessages is the main handler for /v1/messages endpoint.
@@ -110,13 +140,7 @@ func handleMessages(c *fiber.Ctx, cfg *config.Config) error {
 	// Non-streaming response
 	openaiResp, err := callOpenAI(openaiReq, cfg)
 	if err != nil {
-		return c.Status(500).JSON(fiber.Map{
-			"type": "error",
-			"error": fiber.Map{
-				"type":    "api_error",
-				"message": fmt.Sprintf("OpenAI API error: %v", err),
-			},
-		})
+		return writeUpstreamFailure(c, err)
 	}
 
 	// Debug: Log OpenAI response
@@ -185,45 +209,47 @@ func handleStreamingMessages(c *fiber.Ctx, openaiReq *models.OpenAIRequest, cfg 
 	// Track timing for simple log
 	startTime := time.Now()
 
-	// Set SSE headers
-	c.Set("Content-Type", "text/event-stream")
-	c.Set("Cache-Control", "no-cache")
-	c.Set("Connection", "keep-alive")
-	c.Set("X-Accel-Buffering", "no")
+	if cfg.Debug {
+		fmt.Printf("[DEBUG] handleStreamingMessages: Making streaming request to %s\n", cfg.OpenAIBaseURL+"/chat/completions")
+	}
 
-	c.Context().SetBodyStreamWriter(func(w *bufio.Writer) {
+	// Open the upstream stream BEFORE committing any response headers.
+	//
+	// This ordering is load-bearing. Previously the SSE headers (and with them
+	// the 200 status) were written first and the upstream call happened inside
+	// the stream writer, so an upstream rejection could only be reported as an
+	// SSE error event on an HTTP 200 — the status code was gone. Claude Code
+	// reads a 200 as a healthy stream, so a quota rejection became a retryable
+	// 5xx-shaped failure with no recoverable status.
+	if resp, err := callOpenAIStream(openaiReq, cfg); err != nil {
 		if cfg.Debug {
-			fmt.Printf("[DEBUG] StreamWriter: Starting\n")
+			fmt.Printf("[DEBUG] handleStreamingMessages: Request failed: %v\n", err)
 		}
-
-		if cfg.Debug {
-			fmt.Printf("[DEBUG] StreamWriter: Making streaming request to %s\n", cfg.OpenAIBaseURL+"/chat/completions")
-		}
-
-		// Make streaming request with automatic retry logic
-		resp, err := callOpenAIStream(openaiReq, cfg)
-		if err != nil {
-			if cfg.Debug {
-				fmt.Printf("[DEBUG] StreamWriter: Request failed: %v\n", err)
-			}
-			writeSSEError(w, fmt.Sprintf("streaming request failed: %v", err))
-			return
-		}
+		return writeUpstreamFailure(c, err)
+	} else {
 		defer func() { _ = resp.Body.Close() }()
 
-		if cfg.Debug {
-			fmt.Printf("[DEBUG] StreamWriter: Got response, starting streamOpenAIToClaude conversion\n")
-		}
+		// Set SSE headers only now that the upstream agreed to serve.
+		c.Set("Content-Type", "text/event-stream")
+		c.Set("Cache-Control", "no-cache")
+		c.Set("Connection", "keep-alive")
+		c.Set("X-Accel-Buffering", "no")
 
-		// Stream conversion
-		streamOpenAIToClaude(w, resp.Body, openaiReq.Model, cfg, startTime)
+		c.Context().SetBodyStreamWriter(func(w *bufio.Writer) {
+			if cfg.Debug {
+				fmt.Printf("[DEBUG] StreamWriter: Starting\n")
+			}
 
-		if cfg.Debug {
-			fmt.Printf("[DEBUG] StreamWriter: Completed\n")
-		}
-	})
+			// Stream conversion
+			streamOpenAIToClaude(w, resp.Body, openaiReq.Model, cfg, startTime)
 
-	return nil
+			if cfg.Debug {
+				fmt.Printf("[DEBUG] StreamWriter: Completed\n")
+			}
+		})
+
+		return nil
+	}
 }
 
 // ToolCallState tracks the state of a tool call during streaming
@@ -904,7 +930,7 @@ func callOpenAIStreamInternal(req *models.OpenAIRequest, cfg *config.Config) (*h
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
 		_ = resp.Body.Close()
-		return nil, fmt.Errorf("OpenAI API returned status %d: %s", resp.StatusCode, string(body))
+		return nil, newUpstreamError(resp.StatusCode, body)
 	}
 
 	return resp, nil
@@ -1005,7 +1031,7 @@ func callOpenAIInternal(req *models.OpenAIRequest, cfg *config.Config) (*models.
 
 	// Check for errors
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("OpenAI API returned status %d: %s", resp.StatusCode, string(respBody))
+		return nil, newUpstreamError(resp.StatusCode, respBody)
 	}
 
 	// Parse response
