@@ -221,35 +221,45 @@ func handleStreamingMessages(c *fiber.Ctx, openaiReq *models.OpenAIRequest, cfg 
 	// SSE error event on an HTTP 200 — the status code was gone. Claude Code
 	// reads a 200 as a healthy stream, so a quota rejection became a retryable
 	// 5xx-shaped failure with no recoverable status.
-	if resp, err := callOpenAIStream(openaiReq, cfg); err != nil {
+	resp, err := callOpenAIStream(openaiReq, cfg)
+	if err != nil {
 		if cfg.Debug {
 			fmt.Printf("[DEBUG] handleStreamingMessages: Request failed: %v\n", err)
 		}
 		return writeUpstreamFailure(c, err)
-	} else {
+	}
+
+	// Set SSE headers only now that the upstream agreed to serve.
+	c.Set("Content-Type", "text/event-stream")
+	c.Set("Cache-Control", "no-cache")
+	c.Set("Connection", "keep-alive")
+	c.Set("X-Accel-Buffering", "no")
+
+	c.Context().SetBodyStreamWriter(func(w *bufio.Writer) {
+		// The upstream body is closed HERE, not by a defer in this function.
+		//
+		// Fiber runs the body stream writer after the handler returns, so a
+		// `defer resp.Body.Close()` in handler scope closes the body before a
+		// single chunk is read. Every streaming request then produced an empty
+		// message (0 output tokens) followed by
+		// "stream read error: http: read on closed response body" — the
+		// c.Gateway error that made all streaming calls fail while
+		// non-streaming calls succeeded.
 		defer func() { _ = resp.Body.Close() }()
 
-		// Set SSE headers only now that the upstream agreed to serve.
-		c.Set("Content-Type", "text/event-stream")
-		c.Set("Cache-Control", "no-cache")
-		c.Set("Connection", "keep-alive")
-		c.Set("X-Accel-Buffering", "no")
+		if cfg.Debug {
+			fmt.Printf("[DEBUG] StreamWriter: Starting\n")
+		}
 
-		c.Context().SetBodyStreamWriter(func(w *bufio.Writer) {
-			if cfg.Debug {
-				fmt.Printf("[DEBUG] StreamWriter: Starting\n")
-			}
+		// Stream conversion
+		streamOpenAIToClaude(w, resp.Body, openaiReq.Model, cfg, startTime)
 
-			// Stream conversion
-			streamOpenAIToClaude(w, resp.Body, openaiReq.Model, cfg, startTime)
+		if cfg.Debug {
+			fmt.Printf("[DEBUG] StreamWriter: Completed\n")
+		}
+	})
 
-			if cfg.Debug {
-				fmt.Printf("[DEBUG] StreamWriter: Completed\n")
-			}
-		})
-
-		return nil
-	}
+	return nil
 }
 
 // ToolCallState tracks the state of a tool call during streaming
