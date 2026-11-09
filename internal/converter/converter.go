@@ -464,13 +464,31 @@ func ConvertResponse(openaiResp *models.OpenAIResponse, requestedModel string) (
 		Content:    contentBlocks,
 		Model:      requestedModel, // Use original requested model
 		StopReason: stopReason,
-		Usage: models.Usage{
-			InputTokens:  openaiResp.Usage.PromptTokens,
-			OutputTokens: openaiResp.Usage.CompletionTokens,
-		},
 	}
+	claudeResp.Usage = convertUsage(openaiResp.Usage)
 
 	return claudeResp, nil
+}
+
+// convertUsage maps OpenAI's inclusive prompt_tokens onto Anthropic's disjoint
+// input/cache_read pair. See the streaming counterpart in
+// server/streamOpenAIToClaude for why subtracting matters: leaving the cached
+// tokens inside input_tokens bills the whole cached prefix a second time, and
+// cost accounting excludes cache_read, so the cache would appear to save nothing.
+func convertUsage(u models.OpenAIUsage) models.Usage {
+	cached := 0
+	if u.PromptTokensDetails != nil && u.PromptTokensDetails.CachedTokens > 0 {
+		cached = u.PromptTokensDetails.CachedTokens
+	}
+	if cached > u.PromptTokens {
+		// Malformed upstream; never produce a negative input count.
+		cached = u.PromptTokens
+	}
+	return models.Usage{
+		InputTokens:          u.PromptTokens - cached,
+		OutputTokens:         u.CompletionTokens,
+		CacheReadInputTokens: cached,
+	}
 }
 
 // convertFinishReason maps OpenAI finish reasons to Claude format

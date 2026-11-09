@@ -295,8 +295,8 @@ func streamOpenAIToClaude(w *bufio.Writer, reader io.Reader, providerModel strin
 
 	// State variables
 	messageID := fmt.Sprintf("msg_%d", time.Now().UnixNano())
-	textBlockIndex := 1                              // Text block is index 1 (thinking is 0)
-	toolBlockCounter := 2                            // Tool calls start at index 2
+	textBlockIndex := 1   // Text block is index 1 (thinking is 0)
+	toolBlockCounter := 2 // Tool calls start at index 2
 	currentToolCalls := make(map[int]*ToolCallState)
 	finalStopReason := "end_turn"
 	usageData := map[string]interface{}{
@@ -399,10 +399,25 @@ func streamOpenAIToClaude(w *bufio.Writer, reader io.Reader, providerModel strin
 				"output_tokens": outputTokens,
 			}
 
-			// Add cache metrics if present
+			// Add cache metrics if present.
+			//
+			// OpenAI's prompt_tokens is the TOTAL prompt size, cached tokens
+			// included. Anthropic's input_tokens and cache_read_input_tokens are
+			// DISJOINT: input_tokens is the uncached remainder. Copying the total
+			// straight into input_tokens billed every cached token twice — once
+			// as input, and again as cache_read (which cost accounting excludes,
+			// so the cache appeared to save nothing and the total was inflated by
+			// the entire cached prefix; 70x on a run with a 97% hit rate).
 			if promptTokensDetails, ok := usage["prompt_tokens_details"].(map[string]interface{}); ok {
 				if cachedTokens, ok := promptTokensDetails["cached_tokens"].(float64); ok && cachedTokens > 0 {
-					usageData["cache_read_input_tokens"] = int(cachedTokens)
+					cached := int(cachedTokens)
+					// A provider reporting more cached than total is malformed;
+					// never let the subtraction go negative.
+					if cached > inputTokens {
+						cached = inputTokens
+					}
+					usageData["cache_read_input_tokens"] = cached
+					usageData["input_tokens"] = inputTokens - cached
 				}
 			}
 			if cfg.Debug {

@@ -96,10 +96,16 @@ type ClaudeResponse struct {
 	Usage        Usage          `json:"usage"`
 }
 
-// Usage represents token usage information
+// Usage represents token usage information.
+//
+// The two fields are disjoint, matching Anthropic's contract: CacheReadInputTokens
+// is what was served from the prompt cache, and InputTokens is the remainder that
+// was billed as fresh input. OpenAI's prompt_tokens is their sum.
 type Usage struct {
-	InputTokens  int `json:"input_tokens"`
-	OutputTokens int `json:"output_tokens"`
+	InputTokens              int `json:"input_tokens"`
+	OutputTokens             int `json:"output_tokens"`
+	CacheReadInputTokens     int `json:"cache_read_input_tokens"`
+	CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
 }
 
 // OpenAIResponse represents the OpenAI API response
@@ -119,9 +125,20 @@ type OpenAIChoice struct {
 	FinishReason *string       `json:"finish_reason"`
 }
 
-// OpenAIUsage represents token usage in OpenAI format
+// OpenAIUsage represents token usage in OpenAI format.
+//
+// PromptTokens is the TOTAL prompt size, cached tokens included; the cached
+// share is reported separately in PromptTokensDetails.
 type OpenAIUsage struct {
-	PromptTokens     int `json:"prompt_tokens"`
-	CompletionTokens int `json:"completion_tokens"`
-	TotalTokens      int `json:"total_tokens"`
+	PromptTokens        int                        `json:"prompt_tokens"`
+	CompletionTokens    int                        `json:"completion_tokens"`
+	TotalTokens         int                        `json:"total_tokens"`
+	PromptTokensDetails *OpenAIPromptTokensDetails `json:"prompt_tokens_details,omitempty"`
+}
+
+// OpenAIPromptTokensDetails carries the sub-counts behind PromptTokens.
+// Only CachedTokens is modelled: it is the field every OpenAI-compatible
+// upstream uses to report automatic prefix-cache hits.
+type OpenAIPromptTokensDetails struct {
+	CachedTokens int `json:"cached_tokens"`
 }
