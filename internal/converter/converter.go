@@ -166,6 +166,23 @@ func ConvertRequest(claudeReq models.ClaudeRequest, cfg *config.Config) (*models
 			if len(claudeReq.Tools) > 0 {
 				openaiReq.ToolChoice = "required"
 			}
+
+		default:
+			// Any other OpenAI-compatible endpoint — in practice a self-hosted
+			// gateway such as the ds-flash one behind 192.168.112.170:3000.
+			//
+			// Without this branch those endpoints got no stream_options at all,
+			// so a streaming response carried usage only if the upstream
+			// volunteered it. Token accounting then depended on provider
+			// goodwill: an upstream that stays silent makes every request look
+			// free. include_usage is the standard OpenAI field for "send a final
+			// usage chunk" and every compatible server we route to honours it.
+			//
+			// No reasoning/tool_choice extras: this branch is the one place we
+			// know nothing about the target, so it must not guess.
+			openaiReq.StreamOptions = map[string]interface{}{
+				"include_usage": true,
+			}
 		}
 	}
 
