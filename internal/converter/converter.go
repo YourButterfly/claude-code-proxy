@@ -8,6 +8,7 @@ package converter
 import (
 	"encoding/json"
 	"fmt"
+	"regexp"
 	"strings"
 
 	"github.com/claude-code-proxy/proxy/internal/config"
@@ -25,6 +26,37 @@ const (
 	DefaultHaikuModel  = "gpt-5-mini"
 )
 
+// volatileCCHPattern matches the per-request cache-checksum field that Claude
+// Code stamps into the x-anthropic-billing-header line of the system prompt:
+//
+//	x-anthropic-billing-header: cc_version=...; cc_entrypoint=sdk-cli; cch=<hex>
+//
+// The value changes on EVERY request. Upstream models that apply automatic
+// prefix caching (e.g. ds-flash) key the cache on the literal prefix, so this
+// single changing token — sitting at roughly offset 92, right at the front of
+// the prompt — made the cache miss every single turn: an entire 250-request
+// run recorded cache_read = 0. Normalizing the value restores reuse (~72% of
+// prompt tokens in a clean replay) without removing the header itself.
+//
+// The pattern is anchored to a line that actually is the billing header so a
+// prompt that merely mentions "cch=" elsewhere is left alone.
+var (
+	billingHeaderLine = regexp.MustCompile(`(?m)^x-anthropic-billing-header:[^\n]*$`)
+	volatileCCH       = regexp.MustCompile(`\bcch=[0-9a-z]+`)
+)
+
+// normalizeBillingHeader rewrites the volatile cch= value in a billing header
+// line to a constant. Everything else — including the rest of the line — is
+// preserved so the header still means what it meant.
+func normalizeBillingHeader(text string) string {
+	if !strings.Contains(text, "x-anthropic-billing-header:") {
+		return text
+	}
+	return billingHeaderLine.ReplaceAllStringFunc(text, func(line string) string {
+		return volatileCCH.ReplaceAllString(line, "cch=00000")
+	})
+}
+
 // extractSystemText extracts system text from Claude's flexible system parameter.
 // Claude supports both string format ("system": "text") and array format with content blocks.
 // This function normalizes both formats to a single string for OpenAI compatibility.
@@ -35,7 +67,7 @@ func extractSystemText(system interface{}) string {
 
 	// Handle string format
 	if systemStr, ok := system.(string); ok {
-		return systemStr
+		return normalizeBillingHeader(systemStr)
 	}
 
 	// Handle array format
@@ -50,7 +82,7 @@ func extractSystemText(system interface{}) string {
 				}
 			}
 		}
-		return strings.Join(textParts, "\n")
+		return normalizeBillingHeader(strings.Join(textParts, "\n"))
 	}
 
 	return ""
