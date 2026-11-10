@@ -7,8 +7,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/claude-code-proxy/proxy/internal/config"
@@ -16,6 +19,76 @@ import (
 	"github.com/claude-code-proxy/proxy/pkg/models"
 	"github.com/gofiber/fiber/v2"
 )
+
+const (
+	// streamingResponseHeaderTimeout bounds how long an upstream may take to
+	// produce response HEADERS. It is the "dead upstream" guard, and it must not
+	// bound the body: see newStreamingClient.
+	streamingResponseHeaderTimeout = 120 * time.Second
+
+	// streamIdleTimeout bounds how long the body may go silent. A generation
+	// that stalls (upstream wedged, connection black-holed by a middlebox) is
+	// caught here; a generation that is merely long is not.
+	//
+	// 180s because an upstream reasoning over a large prefix legitimately shows
+	// no output for a minute or more before the first token; anything below that
+	// trades one failure mode for another. Overridable via STREAM_IDLE_TIMEOUT
+	// (Go duration, e.g. "300s") so a deployment behind an unusually slow
+	// gateway does not need a rebuild.
+	streamIdleTimeoutDefault = 180 * time.Second
+)
+
+// streamIdleTimeout is the effective idle window: STREAM_IDLE_TIMEOUT when set
+// and parseable, the default otherwise. A malformed value falls back rather than
+// failing startup — losing a tunable must not take the proxy down.
+var streamIdleTimeout = func() time.Duration {
+	raw := os.Getenv("STREAM_IDLE_TIMEOUT")
+	if raw == "" {
+		return streamIdleTimeoutDefault
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil || d <= 0 {
+		fmt.Printf(
+			"⚠️  STREAM_IDLE_TIMEOUT=%q is not a positive Go duration; using %s\n",
+			raw, streamIdleTimeoutDefault,
+		)
+		return streamIdleTimeoutDefault
+	}
+	return d
+}()
+
+// newStreamingClient builds the HTTP client used for streaming upstream calls.
+//
+// It has NO http.Client.Timeout on purpose. That field is a deadline for the
+// whole exchange including response-body reads, so on a streaming endpoint it
+// silently caps generation length: a healthy stream emitting a chunk every 2s
+// was killed at exactly 300.0s (quiet_for=0.8s) in local reproduction, and
+// production runs died at 300.4-300.5s with zero tokens. Generation calls that
+// work take 345s, 395s, 552s, 564s, so a whole-request cap cannot be set high
+// enough to be safe without also being useless as a fault detector.
+//
+// The two distinct failure modes are therefore bounded separately:
+//   - upstream never answers      -> streamingResponseHeaderTimeout (Transport)
+//   - upstream answers then stalls -> streamIdleTimeout (per read, in the
+//     stream reader)
+func newStreamingClient() *http.Client {
+	return &http.Client{
+		Transport: &http.Transport{
+			Proxy: http.ProxyFromEnvironment,
+			DialContext: (&net.Dialer{
+				Timeout:   30 * time.Second,
+				KeepAlive: 30 * time.Second,
+			}).DialContext,
+			ForceAttemptHTTP2:     true,
+			MaxIdleConns:          100,
+			IdleConnTimeout:       90 * time.Second,
+			TLSHandshakeTimeout:   15 * time.Second,
+			ExpectContinueTimeout: 1 * time.Second,
+			// Headers only. Body reads are governed by streamIdleTimeout.
+			ResponseHeaderTimeout: streamingResponseHeaderTimeout,
+		},
+	}
+}
 
 // addOpenRouterHeaders adds OpenRouter-specific HTTP headers for better rate limits.
 // Sets HTTP-Referer and X-Title headers when configured, which helps with OpenRouter's
@@ -235,6 +308,16 @@ func handleStreamingMessages(c *fiber.Ctx, openaiReq *models.OpenAIRequest, cfg 
 	c.Set("Connection", "keep-alive")
 	c.Set("X-Accel-Buffering", "no")
 
+	// Always log that the upstream accepted the request, even when nothing
+	// follows.  Diagnosing a mid-stream disconnect ("stream read error: context
+	// deadline exceeded") needs to know WHICH side died: an upstream that never
+	// returned headers fails in callOpenAIStream above, whereas this line proves
+	// headers arrived and the failure is in the body.  Without it both cases look
+	// identical from the client (one 115-byte error line, zero tokens).
+	fmt.Printf("[%s] [STREAM-OPEN] tag=%s %s model=%s status=%d duration_to_headers=%.1fs\n",
+		time.Now().Format("15:04:05"), streamTag(startTime), cfg.OpenAIBaseURL,
+		openaiReq.Model, resp.StatusCode, time.Since(startTime).Seconds())
+
 	c.Context().SetBodyStreamWriter(func(w *bufio.Writer) {
 		// The upstream body is closed HERE, not by a defer in this function.
 		//
@@ -287,10 +370,45 @@ type ToolCallState struct {
 // The function maintains state to track content block indices, tool call accumulation,
 // and ensures proper event ordering for Claude Code compatibility.
 func streamOpenAIToClaude(w *bufio.Writer, reader io.Reader, providerModel string, cfg *config.Config, startTime time.Time) {
+	streamOpenAIToClaudeWithIdle(w, reader, providerModel, cfg, startTime, streamIdleTimeout)
+}
+
+// streamOpenAIToClaudeWithIdle is streamOpenAIToClaude with an injectable idle
+// timeout so tests can exercise the stall path without waiting minutes.
+func streamOpenAIToClaudeWithIdle(w *bufio.Writer, reader io.Reader, providerModel string, cfg *config.Config, startTime time.Time, idle time.Duration) {
 	if cfg.Debug {
 		fmt.Printf("[DEBUG] streamOpenAIToClaude: Starting conversion\n")
 	}
-	scanner := bufio.NewScanner(reader)
+	// Instrumentation for mid-stream disconnects.  A "stream read error" on a
+	// 0-token call is the signature of the upstream or an intermediary going
+	// silent, and the error string alone cannot say whether ANY bytes ever
+	// arrived, how long the stream was quiet before it broke, or whether chunks
+	// were already forwarded.  Those three facts decide whether the culprit is
+	// the upstream, the link, or this proxy.
+	//
+	// The counters live in the reader (not in locals) because the idle-timeout
+	// path can leave a read goroutine running after this function has moved on;
+	// reading them through its mutex is what keeps this log line race-free.
+	tag := streamTag(startTime)
+	var eventsIn int
+	var downstreamErr error
+	counting := &countingReader{r: reader, idle: idle}
+	streamReport := func() (int64, time.Time, time.Time) { return counting.snapshot() }
+	defer func() {
+		bytesIn, firstChunkAt, lastChunkAt := streamReport()
+		extra := ""
+		if downstreamErr != nil {
+			extra = fmt.Sprintf(" downstream_gone=%v", downstreamErr)
+		}
+		fmt.Printf(
+			"[%s] [STREAM-CLOSE] tag=%s %s model=%s elapsed=%.1fs bytes_from_upstream=%d "+
+				"events=%d first_chunk_after=%s quiet_for=%s%s\n",
+			time.Now().Format("15:04:05"), tag, cfg.OpenAIBaseURL, providerModel,
+			time.Since(startTime).Seconds(), bytesIn, eventsIn, firstChunkLatency(firstChunkAt, startTime),
+			quietFor(lastChunkAt), extra,
+		)
+	}()
+	scanner := bufio.NewScanner(counting)
 	scanner.Buffer(make([]byte, 64*1024), 1024*1024) // Increase buffer size
 
 	// State variables
@@ -349,6 +467,20 @@ func streamOpenAIToClaude(w *bufio.Writer, reader io.Reader, providerModel strin
 	// Process streaming chunks
 	for scanner.Scan() {
 		line := scanner.Text()
+		eventsIn++
+
+		// Stop pulling from the upstream once the downstream is gone.
+		//
+		// Every flush below reports whether the client socket is still writable.
+		// When it is not, continuing to read the upstream means holding an
+		// AbortController-less connection open for a generation nobody will see,
+		// and buffering every chunk of it. This used to be masked by
+		// http.Client.Timeout (the whole request died at 300s regardless); with
+		// that cap correctly removed, nothing else bounds it.
+		if werr := w.Flush(); werr != nil {
+			downstreamErr = werr
+			return
+		}
 
 		// Skip empty lines and comments
 		if line == "" || strings.HasPrefix(line, ":") {
@@ -804,8 +936,160 @@ func streamOpenAIToClaude(w *bufio.Writer, reader io.Reader, providerModel strin
 
 	// Check for scanner errors
 	if err := scanner.Err(); err != nil {
+		// Log before writing the SSE error: the client reports only a one-line
+		// "API Error", so this line is the only record of what actually broke.
+		bytesIn, firstChunkAt, lastChunkAt := streamReport()
+		fmt.Printf(
+			"[%s] [STREAM-ERROR] tag=%s %s model=%s elapsed=%.1fs "+
+				"bytes_from_upstream=%d events=%d first_chunk_after=%s "+
+				"quiet_for=%s err=%v\n",
+			time.Now().Format("15:04:05"), tag, cfg.OpenAIBaseURL, providerModel,
+			time.Since(startTime).Seconds(), bytesIn, eventsIn,
+			firstChunkLatency(firstChunkAt, startTime),
+			quietFor(lastChunkAt), err,
+		)
 		writeSSEError(w, fmt.Sprintf("stream read error: %v", err))
 	}
+}
+
+// truncateForLog bounds an upstream error body so one verbose HTML/JSON error
+// page cannot swamp the proxy log.  Newlines are flattened because each log line
+// is meant to stay one line, grep-able.
+func truncateForLog(b []byte, max int) string {
+	s := strings.Join(strings.Fields(string(b)), " ")
+	if len(s) > max {
+		return s[:max] + "…(truncated)"
+	}
+	return s
+}
+
+// streamTag produces a short identifier for one request so its STREAM-OPEN,
+// STREAM-ERROR and STREAM-CLOSE lines can be matched up.
+//
+// The proxy serves several concurrent streams against the same base_url and the
+// same model name, so those two fields alone do not say which CLOSE belongs to
+// which OPEN — the very pairing needed when two runs on one machine hit the
+// disconnect at the same time.  Nanoseconds are unique per call and are already
+// the seed of message_start's id, which ties a log line to the SSE the client
+// actually received.
+func streamTag(startTime time.Time) string {
+	return fmt.Sprintf("r%x", startTime.UnixNano())
+}
+
+// firstChunkLatency reports how long the upstream stayed silent AFTER its
+// headers arrived.  That duration is the one fact that separates the two
+// indistinguishable "stream read error" failures: an upstream that produced
+// nothing at all (headers then a broken/empty body) versus one that streamed
+// normally and was cut off later.  Returns "never" when no body byte ever
+// arrived.
+func firstChunkLatency(firstChunkAt, startTime time.Time) string {
+	if firstChunkAt.IsZero() {
+		return "never"
+	}
+	return fmt.Sprintf("%.1fs", firstChunkAt.Sub(startTime).Seconds())
+}
+
+// quietFor is time.Since(lastRead) with the zero-value case handled.  A stream
+// that never delivered a byte has no meaningful "last read" — subtracting the
+// zero Time prints ~9.2e9 seconds (1970-01-01), which reads like a bug in the
+// log rather than the fact it is.
+func quietFor(lastRead time.Time) string {
+	if lastRead.IsZero() {
+		return "n/a"
+	}
+	return fmt.Sprintf("%.1fs", time.Since(lastRead).Seconds())
+}
+
+// countingReader records how many bytes the upstream has delivered and when the
+// most recent read returned them, AND enforces an idle (no-data) timeout.
+//
+// The idle deadline is the streaming-correct replacement for
+// http.Client.Timeout, which cannot be used here because it caps total duration
+// rather than silence. Resetting the timer on every successful read means a long
+// generation is never cut off while a stalled one still fails promptly.
+//
+// The byte counters serve a second purpose: the last-read timestamp is what
+// separates "slow but healthy" from "went silent". A stream that breaks after
+// 300s of steady chunks is a different fault from one that breaks after 300s of
+// nothing, but both surface as the same "context deadline exceeded" text at the
+// client.
+type countingReader struct {
+	r io.Reader
+
+	// mu guards the fields below. They are written by the read goroutine, which
+	// can outlive Read() after an idle timeout, and read by the caller's
+	// STREAM-CLOSE log line — genuinely concurrent, so they need a lock rather
+	// than the "only one goroutine touches them" assumption that held before the
+	// idle timer introduced a second one.
+	mu       sync.Mutex
+	n        int64
+	last     time.Time
+	first    time.Time
+	detached bool // an abandoned read may still update the counters
+
+	idle time.Duration
+}
+
+func (c *countingReader) Read(p []byte) (int, error) {
+	if c.idle <= 0 {
+		n, err := c.r.Read(p)
+		c.record(n)
+		return n, err
+	}
+
+	// Read in a goroutine so the timer can fire while the upstream is silent.
+	type result struct {
+		n   int
+		err error
+	}
+	done := make(chan result, 1)
+	go func() {
+		n, err := c.r.Read(p)
+		c.record(n)
+		done <- result{n, err}
+	}()
+
+	timer := time.NewTimer(c.idle)
+	defer timer.Stop()
+	select {
+	case res := <-done:
+		return res.n, res.err
+	case <-timer.C:
+		// The abandoned Read still owns p. Reading it again would race with the
+		// goroutine above writing into the same buffer — and after the caller
+		// has already turned this into an error, nothing more should be read
+		// anyway. Latch that so the returned error is final.
+		c.mu.Lock()
+		c.detached = true
+		received := c.n
+		c.mu.Unlock()
+		return 0, fmt.Errorf(
+			"upstream sent no data for %s (idle timeout, %d bytes received so far)",
+			c.idle, received,
+		)
+	}
+}
+
+func (c *countingReader) record(n int) {
+	if n <= 0 {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.n += int64(n)
+	now := time.Now()
+	c.last = now
+	if c.first.IsZero() {
+		c.first = now
+	}
+}
+
+// snapshot returns the byte total and read timestamps safely, even while an
+// abandoned read goroutine is still running.
+func (c *countingReader) snapshot() (n int64, first, last time.Time) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.n, c.first, c.last
 }
 
 // writeSSEEvent writes a Server-Sent Event
@@ -940,14 +1224,40 @@ func callOpenAIStreamInternal(req *models.OpenAIRequest, cfg *config.Config) (*h
 		addOpenRouterHeaders(httpReq, cfg)
 	}
 
-	// Create HTTP client with longer timeout for streaming
-	client := &http.Client{
-		Timeout: 300 * time.Second,
-	}
+	// No overall Timeout here — deliberately.
+	//
+	// http.Client.Timeout covers the ENTIRE exchange, response-body reads
+	// included. On a streaming endpoint the body IS the response: a healthy
+	// generation that keeps producing tokens for longer than the budget is cut
+	// off mid-sentence. Measured locally against an upstream emitting one chunk
+	// every 2s, the stream died at exactly 300.0s with
+	// "context deadline exceeded (Client.Timeout ... while reading body)" and
+	// quiet_for=0.8s — i.e. the connection was perfectly alive and still got
+	// killed. The same thing happened in production runs: three calls ended at
+	// 300.4-300.5s with zero tokens, which the client can only report as
+	// "stream read error". Generation calls routinely run 345s, 395s, 552s.
+	//
+	// The two timeouts such a client actually needs are split instead:
+	//   - time-to-first-byte is bounded by streamingResponseHeaderTimeout below
+	//     (via a custom Transport), so a dead upstream still fails fast;
+	//   - a mid-stream stall is bounded by streamIdleTimeout in
+	//     streamOpenAIToClaude, which only fires when the upstream goes quiet —
+	//     a slow-but-healthy generation is never punished for being long.
+	client := newStreamingClient()
 
 	// Make request
+	startWait := time.Now()
 	resp, err := client.Do(httpReq)
 	if err != nil {
+		// Log the upstream-side failure explicitly.  Until now a request that
+		// never got headers produced no proxy log line at all (the success-only
+		// [REQ] summary cannot fire), so "upstream never answered" and "upstream
+		// answered and the body broke" were indistinguishable in the logs.
+		fmt.Printf(
+			"[%s] [UPSTREAM-ERROR] %s model=%s waited=%.1fs err=%v\n",
+			time.Now().Format("15:04:05"), cfg.OpenAIBaseURL, req.Model,
+			time.Since(startWait).Seconds(), err,
+		)
 		return nil, fmt.Errorf("request failed: %w", err)
 	}
 
@@ -955,6 +1265,11 @@ func callOpenAIStreamInternal(req *models.OpenAIRequest, cfg *config.Config) (*h
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
 		_ = resp.Body.Close()
+		fmt.Printf(
+			"[%s] [UPSTREAM-STATUS] %s model=%s status=%d waited=%.1fs body=%s\n",
+			time.Now().Format("15:04:05"), cfg.OpenAIBaseURL, req.Model,
+			resp.StatusCode, time.Since(startWait).Seconds(), truncateForLog(body, 300),
+		)
 		return nil, newUpstreamError(resp.StatusCode, body)
 	}
 

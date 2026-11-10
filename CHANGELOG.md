@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **长流被 300s 整体超时腰斩**（`stream read error: context deadline exceeded`）
+  - 根因：流式上游用 `http.Client{Timeout: 300s}`。该字段覆盖整个交换过程
+    **包括响应体读取**，所以在流式接口上它限制的是"生成能持续多久"，而不是
+    "故障多久被发现"。健康的长流也会被拦腰切断。
+  - 实测：每 2s 吐一块、持续 340s 的上游，在 **恰好 300.0s** 被切断，
+    `quiet_for=0.8s`（连接完全正常）；发完头就静默的上游同样 300.0s。
+    两者在客户端表现完全相同，无法区分。
+  - 现场：run 268 有三次调用结束于 300.4–300.5s、token 全为 0；而成功的
+    生成调用分别耗时 345s、395s、552s、564s。整体超时设多高都不安全。
+  - 修复：上游客户端不再设整体 `Timeout`，改为分别约束两种真实故障：
+    - `streamingResponseHeaderTimeout`（120s，Transport 层）— 上游不回头部
+    - `streamIdleTimeout`（默认 180s，可用 `STREAM_IDLE_TIMEOUT` 覆盖）—
+      上游回了头但中途静默；每次成功读取都重置计时，长流不受影响
+  - 同时补上：下游客户端断开后停止继续读取上游（此前这个泄漏被 300s
+    整体超时掩盖，去掉后必须显式处理，否则每个废弃请求都会一直拉起上游）
+
+### Added
+- 流式诊断日志（不受 `-d`/`-s` 开关影响，生产默认开启）：
+  `[STREAM-OPEN]` / `[STREAM-ERROR]` / `[STREAM-CLOSE]` /
+  `[UPSTREAM-ERROR]` / `[UPSTREAM-STATUS]`
+  - 每条带 `tag=`，可把同一请求的 OPEN/ERROR/CLOSE 对上，多路并发不混淆
+  - `bytes_from_upstream` / `events` / `first_chunk_after` / `quiet_for`
+    直接回答"上游到底有没有发过数据、沉默多久、断在哪一侧"
+  - 此前代理以无 flag 启动（`proxy_manager` 不带 `-s`/`-d`），
+    一次请求日志都没有，故障只能看到客户端一句 "stream read error"
+
 ## [1.3.0] - 2025-11-13
 
 ### Added
