@@ -1352,8 +1352,16 @@ func callOpenAIInternal(req *models.OpenAIRequest, cfg *config.Config) (*models.
 	}
 
 	// Create HTTP client with timeout
+	//
+	// Unlike the streaming path this one keeps a whole-request Timeout: a
+	// non-streaming completion arrives as a single body, so "total duration"
+	// genuinely is the thing to bound (there is no meaningful "idle" signal to
+	// reset on). It is raised from 90s to 600s because the same quota/gateway
+	// behaviour applies — a large prompt that still completes in three minutes
+	// used to be thrown away. Claude Code only falls back to this path for
+	// requests without `stream: true`.
 	client := &http.Client{
-		Timeout: 90 * time.Second,
+		Timeout: 600 * time.Second,
 	}
 
 	// Make request
